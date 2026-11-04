@@ -1,0 +1,5 @@
+{
+  "summary": "Detailed technical and functional overview of the Monster Quiz Solver application, covering its purpose, hybrid solving pipeline (local multi-orientation DCT pHash + color signatures + Gemini AI fallback), core components, real-time Firebase synchronization, analytics & spawn prediction engine, and backend proxy architecture.",
+  "updatedAt": "2026-11-04T21:00:20.037300493Z",
+  "userFacing": true
+}
