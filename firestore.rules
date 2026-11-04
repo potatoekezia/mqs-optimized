@@ -38,9 +38,7 @@ service cloud.firestore {
     }
 
     match /config/geminiKeys {
-      // Allow authenticated users to read and write the key pool
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read, write: if false;
     }
 
     match /config/appSettings {
