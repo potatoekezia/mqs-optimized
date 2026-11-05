@@ -2849,6 +2849,7 @@
                 'invalid_key',
                 'permission_denied',
                 'model_not_found',
+                'timeout',
                 'error',
                 'skipped_cooldown'
             ]);
@@ -4861,6 +4862,7 @@
             if (outcome === 'invalid_key') return 'invalid';
             if (outcome === 'permission_denied') return '403';
             if (outcome === 'model_not_found') return '404';
+            if (outcome === 'timeout') return 'timeout';
             return 'error';
         }
 
@@ -5206,6 +5208,7 @@
             try {
                 const img = await loadImage(currentScreenshot);
                 const crops = await cropManualCircles(img);
+                const tAfterCrop = performance.now();
                 const targets = crops.filter(c => c.type === 'target');
                 const answers = crops.filter(c => c.type === 'answer');
 
@@ -5225,20 +5228,27 @@
                     [PIPELINE START] Threshold: ${threshold}% | Dict Size: ${dictionary.length}
                 </div>`;
 
-                // Pre-compute multi-orientation hashes and color signatures for both targets and answers
-                const targetMultiHashes = [];
-                const targetColors = [];
-                for (let tIdx = 0; tIdx < targets.length; tIdx++) {
-                    targetMultiHashes.push(await computeMultiOrientationPHashes(targets[tIdx].data));
-                    targetColors.push(await computeColorSignature(targets[tIdx].data));
-                }
-
-                const answerMultiHashes = [];
-                const answerColors = [];
-                for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                    answerMultiHashes.push(await computeMultiOrientationPHashes(answers[aIdx].data));
-                    answerColors.push(await computeColorSignature(answers[aIdx].data));
-                }
+                // Pre-compute multi-orientation hashes and color signatures for all 7 crops in parallel
+                const [targetFeatureList, answerFeatureList] = await Promise.all([
+                    Promise.all(targets.map(async (t) => {
+                        const [multiHashes, color] = await Promise.all([
+                            computeMultiOrientationPHashes(t.data),
+                            computeColorSignature(t.data)
+                        ]);
+                        return { multiHashes, color };
+                    })),
+                    Promise.all(answers.map(async (a) => {
+                        const [multiHashes, color] = await Promise.all([
+                            computeMultiOrientationPHashes(a.data),
+                            computeColorSignature(a.data)
+                        ]);
+                        return { multiHashes, color };
+                    }))
+                ]);
+                const targetMultiHashes = targetFeatureList.map(f => f.multiHashes);
+                const targetColors = targetFeatureList.map(f => f.color);
+                const answerMultiHashes = answerFeatureList.map(f => f.multiHashes);
+                const answerColors = answerFeatureList.map(f => f.color);
 
                 // Cost matrix: target i -> answer j similarity
                 const scoreMatrix = [];
@@ -5367,6 +5377,10 @@
                         return score >= threshold && entry && score >= 75 && results[tIdx].hasRealAnswerMatch;
                     });
                 }
+                const tAfterMatch = performance.now();
+                let tGeminiStart = 0;
+                let tGeminiEnd = 0;
+                let historySourceOverride = null;
 
                 if (allDictConfident) {
                     matchSource.innerText = "Solved via pHash";
@@ -5389,11 +5403,29 @@
                         });
                     }
 
-                    const geminiOutcome = await callGeminiForPuzzle(
-                        currentScreenshot, targets, answers, results, lockedResults
-                    );
+                    const elapsedSoFar = performance.now() - startTime;
+                    const deadlineMs = Math.max(50, 5000 - elapsedSoFar - 300);
+                    const geminiAbortController = new AbortController();
+                    let deadlineTimer = null;
+
+                    tGeminiStart = performance.now();
+                    const geminiOutcome = await Promise.race([
+                        callGeminiForPuzzle(
+                            currentScreenshot, targets, answers, results, lockedResults, geminiAbortController.signal
+                        ),
+                        new Promise((resolve) => {
+                            deadlineTimer = setTimeout(() => {
+                                geminiAbortController.abort();
+                                resolve({ digits: "000", timedOut: true, errorReason: "deadline_exceeded" });
+                            }, deadlineMs);
+                        })
+                    ]);
+                    if (deadlineTimer) clearTimeout(deadlineTimer);
+                    tGeminiEnd = performance.now();
+
                     const geminiResult = typeof geminiOutcome === 'string' ? geminiOutcome : (geminiOutcome?.digits || "000");
                     const geminiErrorReason = typeof geminiOutcome === 'object' ? geminiOutcome?.errorReason : null;
+                    const geminiTimedOut = typeof geminiOutcome === 'object' && Boolean(geminiOutcome?.timedOut);
                     const geminiDigits = (geminiResult.match(/[1-4]/g) || []).map(Number);
 
                     // Reconcile Gemini picks guaranteeing ZERO DUPLICATES and 1-to-1 matching
@@ -5441,8 +5473,11 @@
                     formatResultNumbers();
 
                     const lockedCount = lockedResults.length;
-                    const geminiSucceeded = geminiDigits && geminiDigits.length >= 3;
-                    if (!geminiSucceeded) {
+                    const geminiSucceeded = !geminiTimedOut && geminiDigits && geminiDigits.length >= 3;
+                    if (geminiTimedOut) {
+                        matchSource.innerText = "Unverified (time limit): local best guess";
+                        historySourceOverride = "pHash-unverified";
+                    } else if (!geminiSucceeded) {
                         const failLabel = geminiErrorReason === 'quota_exhausted'
                             ? 'all keys rate limited'
                             : `request failed: ${geminiErrorReason || 'error'}`;
@@ -5456,7 +5491,16 @@
                     }
                 }
 
-                const totalSeconds = (performance.now() - startTime) / 1000;
+                const tEnd = performance.now();
+                const cropMs = Math.round(tAfterCrop - startTime);
+                const matchMs = Math.round(tAfterMatch - tAfterCrop);
+                const geminiMs = tGeminiStart > 0 ? Math.round(tGeminiEnd - tGeminiStart) : 0;
+                const totalMs = Math.round(tEnd - startTime);
+                if (debugContent) {
+                    debugContent.innerHTML += `<div style="padding:4px 8px; background:rgba(0,0,0,0.4); border-radius:4px; font-size:9px; margin-top:4px; color:#38bdf8; font-family:monospace;">t: crop ${cropMs}ms | match ${matchMs}ms | gemini ${geminiMs}ms | total ${totalMs}ms</div>`;
+                }
+
+                const totalSeconds = (tEnd - startTime) / 1000;
                 const mins = Math.floor(totalSeconds / 60);
                 const secs = (totalSeconds % 60).toFixed(1);
                 document.getElementById('solve-time').innerText = `Time: ${mins}m ${secs}s`;
@@ -5472,7 +5516,7 @@
                     for (let a of answers) {
                         if (a && a.data) compressedAnswers.push(await compressCircleCrop(a.data, 56));
                     }
-                    recordSolverHistory(solvedDigits.substring(0, 3), compressedTargets, compressedAnswers, totalSeconds, matchSource.innerText, lastGeminiAttemptLog);
+                    recordSolverHistory(solvedDigits.substring(0, 3), compressedTargets, compressedAnswers, totalSeconds, historySourceOverride || matchSource.innerText, lastGeminiAttemptLog);
                 }
 
                 // Auto Refresh Solver after configured seconds
@@ -5843,18 +5887,54 @@
             return hash;
         }
 
+        const DCT_COS_TABLE = (() => {
+            const table = [];
+            for (let k = 0; k < 8; k++) {
+                const row = new Float64Array(32);
+                for (let n = 0; n < 32; n++) {
+                    row[n] = Math.cos(((2 * n + 1) * k * Math.PI) / 64);
+                }
+                table.push(row);
+            }
+            return table;
+        })();
+
+        const DCT_SCALE = (() => {
+            const c = new Float32Array(8);
+            c[0] = 1 / Math.sqrt(2);
+            for (let i = 1; i < 8; i++) c[i] = 1;
+            return c;
+        })();
+
         function applyDCT(data, size) {
             const result = new Float32Array(size * size);
-            const c = new Float32Array(size);
-            for (let i = 1; i < size; i++) c[i] = 1;
-            c[0] = 1 / Math.sqrt(2);
-            for (let u = 0; u < size; u++) {
-                for (let v = 0; v < size; v++) {
+            const temp = new Float64Array(32 * 8);
+
+            // Row pass: compute u in 0..7 for each row y in 0..31
+            for (let y = 0; y < 32; y++) {
+                const rowOffset = y * 32;
+                const tempOffset = y * 8;
+                for (let u = 0; u < 8; u++) {
+                    const cosU = DCT_COS_TABLE[u];
                     let sum = 0;
-                    for (let x = 0; x < size; x++) for (let y = 0; y < size; y++) {
-                        sum += data[y * size + x] * Math.cos(((2*x+1)*u*Math.PI)/(2*size)) * Math.cos(((2*y+1)*v*Math.PI)/(2*size));
+                    for (let x = 0; x < 32; x++) {
+                        sum += data[rowOffset + x] * cosU[x];
                     }
-                    result[v * size + u] = 0.25 * c[u] * c[v] * sum;
+                    temp[tempOffset + u] = sum;
+                }
+            }
+
+            // Column pass: compute v in 0..7 for each u in 0..7
+            for (let v = 0; v < 8; v++) {
+                const cosV = DCT_COS_TABLE[v];
+                const cv = DCT_SCALE[v];
+                const outOffset = v * size;
+                for (let u = 0; u < 8; u++) {
+                    let sum = 0;
+                    for (let y = 0; y < 32; y++) {
+                        sum += temp[y * 8 + u] * cosV[y];
+                    }
+                    result[outOffset + u] = 0.25 * DCT_SCALE[u] * cv * sum;
                 }
             }
             return result;
@@ -5940,9 +6020,9 @@
         }
 
         async function createCleanQuizGrid(targets, answers) {
-            // Render a clean 2-row comparison grid on a small 400x200 canvas
-            // Row 1: T1, T2, T3 (with labels)
-            // Row 2: A1, A2, A3, A4 (with labels)
+            // Render a clean 2-row comparison grid on a 440x220 canvas
+            // Row 1: unresolved targets (keeping their original Target 1..3 labels)
+            // Row 2: available answers (keeping their original Choice 1..4 labels)
             const canvas = document.createElement('canvas');
             canvas.width = 440;
             canvas.height = 220;
@@ -5950,34 +6030,45 @@
             ctx.fillStyle = "#1e1e24";
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+            const [targetImgs, answerImgs] = await Promise.all([
+                Promise.all(targets.map(t => loadImage(t.data))),
+                Promise.all(answers.map(a => loadImage(a.data)))
+            ]);
+
             // Targets row
             for (let i = 0; i < targets.length; i++) {
-                const img = await loadImage(targets[i].data);
+                const img = targetImgs[i];
                 const x = 50 + i * 120;
                 const y = 15;
                 ctx.drawImage(img, x, y, 70, 70);
                 ctx.fillStyle = "#a78bfa";
                 ctx.font = "bold 13px sans-serif";
-                ctx.fillText(`Target ${i + 1}`, x + 10, y + 84);
+                const label = targets[i].label || `Target ${i + 1}`;
+                ctx.fillText(label, x + 10, y + 84);
             }
 
             // Answers row
             for (let i = 0; i < answers.length; i++) {
-                const img = await loadImage(answers[i].data);
+                const img = answerImgs[i];
                 const x = 20 + i * 105;
                 const y = 115;
                 ctx.drawImage(img, x, y, 65, 65);
                 ctx.fillStyle = "#34d399";
                 ctx.font = "bold 13px sans-serif";
-                ctx.fillText(`Choice ${i + 1}`, x + 8, y + 78);
+                const label = answers[i].label || `Choice ${i + 1}`;
+                ctx.fillText(label, x + 8, y + 78);
             }
 
             return canvas.toDataURL('image/png');
         }
 
-        // In-memory feature caches to maximize Smart Match speed and eliminate redundant canvas processing
+        // In-memory feature caches and shared 32x32 canvas to eliminate redundant canvas creation
         const smartFeatureCache = new Map();
         const dictFeatureIndex = new Map();
+        const sharedFeatureCanvas = document.createElement('canvas');
+        sharedFeatureCanvas.width = 32;
+        sharedFeatureCanvas.height = 32;
+        const sharedFeatureCtx = sharedFeatureCanvas.getContext('2d', { willReadFrequently: true });
 
         async function getOrComputeImageFeatures(dataUrl) {
             if (!dataUrl) return null;
@@ -5988,9 +6079,7 @@
 
             try {
                 const img = await loadImage(dataUrl);
-                const canvas = document.createElement('canvas');
-                canvas.width = 32; canvas.height = 32;
-                const ctx = canvas.getContext('2d');
+                const ctx = sharedFeatureCtx;
                 const orientations = [
                     { rot: 0, flip: false },
                     { rot: 90, flip: false },
@@ -6109,12 +6198,26 @@
             return feat ? feat.multiHashes : [];
         }
 
-        async function callGeminiForPuzzle(screenshot, targets, answers, pHashResults, lockedResults = []) {
+        async function callGeminiForPuzzle(screenshot, targets, answers, pHashResults, lockedResults = [], signal = undefined) {
             const debugContent = document.getElementById('debug-content');
             const contents = { parts: [] };
 
-            // Generate clean, normalized quiz grid (send ONLY the standardized grid + text prompt)
-            const cleanGridData = await createCleanQuizGrid(targets, answers);
+            const lockedTargetIndices = new Set(lockedResults.map(r => r.targetIndex));
+            const lockedAnswerNumbers = new Set(lockedResults.map(r => r.answerIndex));
+
+            const unresolvedTargets = targets
+                .map((t, idx) => ({ ...t, origTargetIndex: idx, origTargetNum: idx + 1, label: `Target ${idx + 1}` }))
+                .filter(t => !lockedTargetIndices.has(t.origTargetIndex));
+
+            const availableAnswers = answers
+                .map((a, idx) => ({ ...a, origChoiceNum: idx + 1, label: `Choice ${idx + 1}` }))
+                .filter(a => !lockedAnswerNumbers.has(a.origChoiceNum));
+
+            const targetsToDraw = unresolvedTargets.length > 0 ? unresolvedTargets : targets.map((t, idx) => ({ ...t, origTargetIndex: idx, origTargetNum: idx + 1, label: `Target ${idx + 1}` }));
+            const answersToDraw = availableAnswers.length > 0 ? availableAnswers : answers.map((a, idx) => ({ ...a, origChoiceNum: idx + 1, label: `Choice ${idx + 1}` }));
+
+            // Generate clean, normalized quiz grid with ONLY unresolved targets and unlocked choices
+            const cleanGridData = await createCleanQuizGrid(targetsToDraw, answersToDraw);
             contents.parts.push({
                 inlineData: {
                     mimeType: "image/png",
@@ -6122,35 +6225,22 @@
                 }
             });
 
-            let lockInstructions = "";
-            if (lockedResults.length > 0) {
-                lockedResults.forEach(res => {
-                    lockInstructions += `Target ${res.targetIndex + 1} = Answer ${res.answerIndex} (LOCKED)\n`;
-                });
-            }
+            const neededCount = targetsToDraw.length;
+            const targetLabelsStr = targetsToDraw.map(t => t.label).join(', ');
+            const choiceLabelsStr = answersToDraw.map(a => a.label).join(', ');
+            const matchedEntries = pHashResults.filter(r => r.entry && !lockedTargetIndices.has(r.targetIndex));
 
-            const matchedEntries = pHashResults.filter(r => r.entry);
+            const prompt = `You are solving a monster matching quiz from the standardized grid image (Row 1: ${targetLabelsStr} | Row 2: ${choiceLabelsStr}).
 
-            const prompt = `You are solving a monster matching quiz from the standardized grid image (Row 1: Target 1, Target 2, Target 3 | Row 2: Choice 1, Choice 2, Choice 3, Choice 4).
-
-TASK: Match each TARGET monster image (Row 1) to its corresponding ANSWER CHOICE (Row 2).
+TASK: Match each TARGET monster in Row 1 (${targetLabelsStr}) to its corresponding ANSWER CHOICE in Row 2 (${choiceLabelsStr}).
 
 KEY FACTS ABOUT THIS QUIZ:
 - Targets and answer choices show the SAME monster but rendered differently
 - Answer choices may be: recolored, tinted, darker/lighter, slightly warped, scaled differently, or have a different background
 - Focus on SHAPE and SILHOUETTE first — color is unreliable
-- Each target has exactly ONE correct answer. All 3 answers must be different numbers.
+- Each target has a distinct correct answer from the shown choices (${choiceLabelsStr}). Use the original Choice number printed under each choice.
 
-${lockInstructions ? `ALREADY CONFIRMED MATCHES (do not change these):\n${lockInstructions}\n` : ''}${matchedEntries.length > 0 ? 'DICTIONARY HINTS (high-confidence pre-matches, treat as strong signals):\n' + matchedEntries.map(r => `- Target ${r.targetIndex + 1} is likely "${r.entry?.name || 'unknown'}"${r.answerIndex ? `, suggested answer: ${r.answerIndex}` : ''}`).join('\n') + '\n' : ''}
-YOUR REASONING STEPS:
-1. For each target, identify the monster's key shape features (body outline, head shape, limbs)
-2. Find the answer choice with the most similar silhouette — ignore color differences
-3. Confirm no two targets share the same answer
-4. If two targets could match the same answer, pick based on silhouette similarity ranking
-
-RESPONSE FORMAT: Respond with ONLY 3 digits, no spaces, no explanation.
-Example: 214
-Example: 132`;
+${matchedEntries.length > 0 ? 'DICTIONARY HINTS (pre-matches):\n' + matchedEntries.map(r => `- Target ${r.targetIndex + 1} is likely "${r.entry?.name || 'unknown'}"${(r.answerIndex && !lockedAnswerNumbers.has(r.answerIndex)) ? `, suggested answer: ${r.answerIndex}` : ''}`).join('\n') + '\n' : ''}RESPONSE FORMAT: Respond with ONLY ${neededCount} digit${neededCount > 1 ? 's' : ''} (the Choice number for ${targetLabelsStr} in order), no spaces, no explanation.`;
 
             contents.parts.push({ text: prompt });
 
@@ -6158,7 +6248,8 @@ Example: 132`;
                 const res = await fetch("/api/gemini/solve", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ contents })
+                    body: JSON.stringify({ contents }),
+                    signal
                 });
 
                 let data;
@@ -6184,12 +6275,29 @@ Example: 132`;
 
                 const text = (data.text || "").trim();
                 const digits = text.match(/[1-4]/g);
-                if (digits && digits.length >= 3) {
+                if (digits && digits.length >= neededCount) {
                     const keyLabel = typeof data.keyIndex === 'number' ? `key #${data.keyIndex}` : 'server';
                     if (debugContent) {
                         debugContent.innerHTML += `<div style="padding:4px 8px; background:rgba(0,0,0,0.3); border-radius:4px; font-size:9px; margin-top:4px; color:#aaa">Gemini [${escapeHtml(keyLabel)}]: "${escapeHtml(text)}"</div>`;
                     }
-                    return { digits: digits.slice(0, 3).join(""), errorReason: null };
+                    // Map returned digit(s) back to the 3 target positions
+                    const mapped = [0, 0, 0];
+                    lockedResults.forEach(l => {
+                        mapped[l.targetIndex] = l.answerIndex;
+                    });
+                    if (digits.length === 3 && neededCount < 3) {
+                        // In case model returned all 3 positions despite asking for neededCount
+                        targetsToDraw.forEach((t, idx) => {
+                            const byOrigPos = Number(digits[t.origTargetIndex]);
+                            const byOrder = Number(digits[idx]);
+                            mapped[t.origTargetIndex] = !lockedAnswerNumbers.has(byOrder) ? byOrder : byOrigPos;
+                        });
+                    } else {
+                        targetsToDraw.forEach((t, idx) => {
+                            mapped[t.origTargetIndex] = Number(digits[idx]);
+                        });
+                    }
+                    return { digits: mapped.join(""), errorReason: null };
                 }
 
                 const invalidFormatDetail = `Unexpected output "${text.slice(0, 80)}"`;
@@ -6198,6 +6306,9 @@ Example: 132`;
                 }
                 return { digits: "000", errorReason: "invalid_output", errorDetail: invalidFormatDetail };
             } catch (err) {
+                if (err?.name === 'AbortError' || signal?.aborted) {
+                    return { digits: "000", timedOut: true, errorReason: "deadline_exceeded" };
+                }
                 lastGeminiAttemptLog = [];
                 const msg = err?.message || String(err);
                 if (debugContent) {

@@ -5,11 +5,20 @@ import { GoogleGenAI } from '@google/genai';
 // and the highest free-tier RPM/RPD quota limits among current Gemini 3 models.
 export const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
+export const GEMINI_GENERATION_CONFIG = {
+  temperature: 0,
+  maxOutputTokens: 8,
+  thinkingConfig: {
+    thinkingBudget: 0,
+  },
+} as const;
+
 export type GeminiFailureReason =
   | 'invalid_key'
   | 'permission_denied'
   | 'quota_exhausted'
   | 'model_not_found'
+  | 'timeout'
   | 'error';
 
 export interface ClassifiedGeminiError {
@@ -38,6 +47,9 @@ export function createGeminiClient(apiKey: string): GoogleGenAI {
 }
 
 export function classifyGeminiError(err: unknown): ClassifiedGeminiError {
+  const isAbort =
+    err instanceof Error &&
+    (err.name === 'AbortError' || err.message.includes('PER_ATTEMPT_TIMEOUT'));
   const raw =
     err instanceof Error
       ? err.message
@@ -46,6 +58,15 @@ export function classifyGeminiError(err: unknown): ClassifiedGeminiError {
         : JSON.stringify(err);
   const detail = raw.slice(0, 200);
   const upper = raw.toUpperCase();
+
+  if (isAbort || upper.includes('PER_ATTEMPT_TIMEOUT') || upper.includes('ABORTERROR')) {
+    return {
+      status: 504,
+      reason: 'timeout',
+      message: 'Gemini API request timed out (3500ms).',
+      detail,
+    };
+  }
 
   if (
     upper.includes('404') ||
