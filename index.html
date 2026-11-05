@@ -859,8 +859,8 @@
                     </div>
                 </div>
                 <div class="slider-container" style="margin-top:8px">
-                    <label>Confidence Threshold: <span id="threshold-val">75</span>%</label>
-                    <input type="range" id="threshold-slider" min="50" max="95" value="75">
+                    <label>Confidence Threshold: <span id="threshold-val">75</span>% <span id="solver-threshold-note" style="font-size:11px; color:var(--text-secondary); font-weight:400;">(Waiting for shared settings)</span></label>
+                    <input type="range" id="threshold-slider" min="50" max="95" value="75" disabled>
                 </div>
             </div>
         </div>
@@ -1364,11 +1364,25 @@
         </div>
 
         <div class="card">
-            <h3>General</h3>
-            <div class="slider-container">
-                <label>Default Confidence: <span id="settings-threshold-val">75</span>%</label>
-                <input type="range" id="settings-threshold-slider" min="50" max="95" value="75">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px;">
+                <h3 style="margin:0;">Confidence Threshold (Shared)</h3>
+                <span id="settings-threshold-lock-badge" style="font-size:11px; font-weight:700; padding:3px 8px; border-radius:4px; background:rgba(74,222,128,0.15); color:#4ade80; border:1px solid rgba(74,222,128,0.3);">🔒 Locked • 75%</span>
             </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <label style="margin:0; font-size:13px; color:var(--text);">Shared Confidence: <strong style="color:var(--accent);"><span id="settings-threshold-val">75</span>%</strong></label>
+                <label style="display:flex; align-items:center; gap:6px; margin:0; font-size:12px; cursor:pointer; user-select:none;">
+                    <input type="checkbox" id="settings-threshold-lock-toggle" checked disabled style="width:16px; height:16px; margin:0;">
+                    Lock
+                </label>
+            </div>
+            <div class="slider-container" style="margin:0;">
+                <input type="range" id="settings-threshold-slider" min="50" max="95" value="75" disabled>
+            </div>
+            <div id="settings-threshold-status-note" style="font-size:11px; color:var(--text-secondary); margin-top:6px;">Waiting for shared settings</div>
+        </div>
+
+        <div class="card">
+            <h3>General</h3>
 
             <div style="margin-top:16px; margin-bottom:16px">
                 <label style="display:block; margin-bottom:6px; font-weight:500; font-size:13px">Auto Refresh Solver (Picked Images & Solved Quizzes):</label>
@@ -1972,26 +1986,145 @@
             startApp();
         }
 
-        function setupEventListeners() {
-            const tSlider = document.getElementById('threshold-slider');
-            const sSlider = document.getElementById('settings-threshold-slider');
-            const tVal = document.getElementById('threshold-val');
-            const sVal = document.getElementById('settings-threshold-val');
+        let sharedThreshold = 75;
+        let sharedThresholdLocked = true;
+        let sharedThresholdLoaded = false;
 
-            if (tSlider && sSlider) {
-                tSlider.oninput = (e) => {
-                    sSlider.value = e.target.value;
-                    if (tVal) tVal.innerText = e.target.value;
-                    if (sVal) sVal.innerText = e.target.value;
-                    localStorage.setItem('threshold', e.target.value);
-                    syncSettingsToFirebase();
+        function renderSharedThresholdUI() {
+            const connectedAndLoaded = Boolean(db && sharedThresholdLoaded);
+            const displayVal = connectedAndLoaded ? sharedThreshold : 75;
+            const isLocked = connectedAndLoaded ? sharedThresholdLocked : true;
+
+            const tSlider = document.getElementById('threshold-slider');
+            const tVal = document.getElementById('threshold-val');
+            const tNote = document.getElementById('solver-threshold-note');
+
+            if (tSlider) {
+                tSlider.value = displayVal;
+                tSlider.disabled = true;
+            }
+            if (tVal) {
+                tVal.innerText = displayVal;
+            }
+            if (tNote) {
+                tNote.style.display = connectedAndLoaded ? 'none' : 'inline';
+            }
+
+            const sSlider = document.getElementById('settings-threshold-slider');
+            const sVal = document.getElementById('settings-threshold-val');
+            const sBadge = document.getElementById('settings-threshold-lock-badge');
+            const sToggle = document.getElementById('settings-threshold-lock-toggle');
+            const sNote = document.getElementById('settings-threshold-status-note');
+
+            if (sSlider) {
+                sSlider.value = displayVal;
+                sSlider.disabled = !connectedAndLoaded || isLocked;
+            }
+            if (sVal) {
+                sVal.innerText = displayVal;
+            }
+            if (sToggle) {
+                sToggle.checked = isLocked;
+                sToggle.disabled = !connectedAndLoaded;
+            }
+            if (sBadge) {
+                if (isLocked) {
+                    sBadge.innerText = `🔒 Locked • ${displayVal}%`;
+                    sBadge.style.background = 'rgba(74,222,128,0.15)';
+                    sBadge.style.color = '#4ade80';
+                    sBadge.style.borderColor = 'rgba(74,222,128,0.3)';
+                } else {
+                    sBadge.innerText = `🔓 Unlocked • ${displayVal}%`;
+                    sBadge.style.background = 'rgba(251,191,36,0.15)';
+                    sBadge.style.color = '#fbbf24';
+                    sBadge.style.borderColor = 'rgba(251,191,36,0.35)';
+                }
+            }
+            if (sNote) {
+                if (!connectedAndLoaded) {
+                    sNote.innerText = 'Waiting for shared settings';
+                    sNote.style.display = 'block';
+                } else {
+                    sNote.style.display = 'none';
+                }
+            }
+        }
+
+        async function saveSharedThreshold(threshold, locked) {
+            if (!db) {
+                renderSharedThresholdUI();
+                return false;
+            }
+            const cleanThreshold = Math.min(95, Math.max(50, Math.round(Number(threshold) || 75)));
+            const cleanLocked = Boolean(locked);
+            try {
+                await db.collection('config').doc('appSettings').set({
+                    threshold: cleanThreshold,
+                    thresholdLocked: cleanLocked,
+                    updatedAt: Date.now()
+                }, { merge: true });
+                sharedThreshold = cleanThreshold;
+                sharedThresholdLocked = cleanLocked;
+                sharedThresholdLoaded = true;
+                renderSharedThresholdUI();
+                showToast(`Shared threshold: ${cleanThreshold}% (${cleanLocked ? 'Locked' : 'Unlocked'})`, "success", 2000);
+                return true;
+            } catch (e) {
+                console.error("Failed to save shared threshold:", e);
+                renderSharedThresholdUI();
+                showToast("Failed to save shared threshold", "error");
+                return false;
+            }
+        }
+
+        function setupEventListeners() {
+            const sSlider = document.getElementById('settings-threshold-slider');
+            const sVal = document.getElementById('settings-threshold-val');
+            const sLockToggle = document.getElementById('settings-threshold-lock-toggle');
+
+            if (sLockToggle) {
+                sLockToggle.onchange = async (e) => {
+                    if (!db || !sharedThresholdLoaded) {
+                        e.target.checked = true;
+                        renderSharedThresholdUI();
+                        return;
+                    }
+                    const wantLocked = Boolean(e.target.checked);
+                    if (!wantLocked) {
+                        const ok = confirm("This threshold is shared by all users. Unlock?");
+                        if (!ok) {
+                            e.target.checked = true;
+                            renderSharedThresholdUI();
+                            return;
+                        }
+                        await saveSharedThreshold(sharedThreshold, false);
+                    } else {
+                        await saveSharedThreshold(sharedThreshold, true);
+                    }
                 };
+            }
+
+            if (sSlider) {
                 sSlider.oninput = (e) => {
-                    tSlider.value = e.target.value;
-                    if (tVal) tVal.innerText = e.target.value;
                     if (sVal) sVal.innerText = e.target.value;
-                    localStorage.setItem('threshold', e.target.value);
-                    syncSettingsToFirebase();
+                };
+                sSlider.onchange = async (e) => {
+                    if (!db || !sharedThresholdLoaded || sharedThresholdLocked) {
+                        renderSharedThresholdUI();
+                        return;
+                    }
+                    const oldVal = sharedThreshold;
+                    const newVal = Math.min(95, Math.max(50, parseInt(e.target.value, 10) || 75));
+                    if (newVal === oldVal) {
+                        renderSharedThresholdUI();
+                        return;
+                    }
+                    const ok = confirm(`Change shared threshold from ${oldVal}% to ${newVal}% for ALL users?`);
+                    if (!ok) {
+                        renderSharedThresholdUI();
+                        return;
+                    }
+                    await saveSharedThreshold(newVal, true);
                 };
             }
 
@@ -2567,7 +2700,6 @@
             try {
                 const settings = {
                     circleConfig: JSON.stringify(circleConfig),
-                    threshold: parseInt(document.getElementById('threshold-slider').value),
                     debugPanelEnabled: document.getElementById('debug-mode-toggle').checked,
                     autoRefreshVal: parseFloat(localStorage.getItem('solver-auto-refresh-val') || 0),
                     autoRefreshUnit: localStorage.getItem('solver-auto-refresh-unit') || 'minutes',
@@ -2592,11 +2724,8 @@
         }
 
         function loadSettings() {
-            const threshold = localStorage.getItem('threshold') || 75;
-            document.getElementById('threshold-slider').value = threshold;
-            document.getElementById('settings-threshold-slider').value = threshold;
-            document.getElementById('threshold-val').innerText = threshold;
-            document.getElementById('settings-threshold-val').innerText = threshold;
+            localStorage.removeItem('threshold');
+            renderSharedThresholdUI();
 
             const savedVal = localStorage.getItem('solver-auto-refresh-val');
             const savedUnit = localStorage.getItem('solver-auto-refresh-unit') || 'minutes';
@@ -4588,24 +4717,31 @@
                 });
 
                 const unsubSettings = db.collection('config').doc('appSettings').onSnapshot(doc => {
-                    if (doc.exists) {
-                        if (doc.metadata && doc.metadata.hasPendingWrites) {
-                            return; // Skip local pending writes to avoid write-feedback loops
-                        }
-                        const data = doc.data();
-                        if (data.circleConfig) {
-                            circleConfig = JSON.parse(data.circleConfig);
-                            localStorage.setItem('circlePositions', data.circleConfig);
-                            renderPreviewCircles();
-                        }
-                        if (data.threshold !== undefined) {
-                            const t = data.threshold;
-                            document.getElementById('threshold-slider').value = t;
-                            document.getElementById('settings-threshold-slider').value = t;
-                            document.getElementById('threshold-val').innerText = t;
-                            document.getElementById('settings-threshold-val').innerText = t;
-                            localStorage.setItem('threshold', t);
-                        }
+                    if (!doc.exists) {
+                        sharedThreshold = 75;
+                        sharedThresholdLocked = true;
+                        sharedThresholdLoaded = true;
+                        renderSharedThresholdUI();
+                        return;
+                    }
+                    const data = doc.data() || {};
+                    sharedThreshold = (typeof data.threshold === 'number' && !isNaN(data.threshold))
+                        ? Math.min(95, Math.max(50, Math.round(data.threshold)))
+                        : 75;
+                    sharedThresholdLocked = (typeof data.thresholdLocked === 'boolean')
+                        ? data.thresholdLocked
+                        : true;
+                    sharedThresholdLoaded = true;
+                    renderSharedThresholdUI();
+
+                    if (doc.metadata && doc.metadata.hasPendingWrites) {
+                        return; // Skip local pending writes for other settings to avoid write-feedback loops
+                    }
+                    if (data.circleConfig) {
+                        circleConfig = JSON.parse(data.circleConfig);
+                        localStorage.setItem('circlePositions', data.circleConfig);
+                        renderPreviewCircles();
+                    }
                         if (data.autoRefreshSeconds !== undefined || data.autoRefreshVal !== undefined) {
                             const unit = data.autoRefreshUnit || (data.autoRefreshVal !== undefined ? 'minutes' : 'seconds');
                             const val = data.autoRefreshVal !== undefined ? data.autoRefreshVal : (unit === 'minutes' ? (data.autoRefreshSeconds / 60) : data.autoRefreshSeconds);
@@ -4670,7 +4806,6 @@
                                 saveHistoryToCloud(pruned);
                             }
                         }
-                    }
                 });
                 activeDbListeners.push(unsubSettings);
 
@@ -4833,6 +4968,8 @@
             clearActiveDbListeners();
             try { if (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length > 0) await Promise.all(firebase.apps.map(app => app.delete())); } catch (e) {}
             db = null; storage = null; firebaseApp = null;
+            sharedThreshold = 75; sharedThresholdLocked = true; sharedThresholdLoaded = false;
+            renderSharedThresholdUI();
             dictionary = []; localStorage.removeItem('dictionary_cache');
             renderDictionary();
             updateFirebaseStatus('disconnected', 'Firebase: Disconnected (Fields Cleared)');
@@ -4845,6 +4982,8 @@
             clearActiveDbListeners();
             try { if (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length > 0) await Promise.all(firebase.apps.map(app => app.delete())); } catch (e) {}
             db = null; storage = null; firebaseApp = null;
+            sharedThreshold = 75; sharedThresholdLocked = true; sharedThresholdLoaded = false;
+            renderSharedThresholdUI();
             dictionary = []; localStorage.removeItem('dictionary_cache');
             renderDictionary();
             updateFirebaseStatus('disconnected', 'Firebase: Disconnected');
@@ -5221,7 +5360,7 @@
                 }
 
                 matchSource.innerText = "Matching with dictionary...";
-                const threshold = parseInt(document.getElementById('threshold-slider').value);
+                const threshold = sharedThreshold;
                 const results = [];
 
                 let debugHTML = `<div style="padding:8px; background:rgba(0,0,0,0.5); border-radius:4px; margin-bottom:8px; font-size:10px">
