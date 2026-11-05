@@ -30,6 +30,20 @@ function shuffleIndices(indices: number[]): number[] {
   return arr;
 }
 
+export type AttemptOutcome =
+  | 'ok'
+  | 'quota_exhausted'
+  | 'invalid_key'
+  | 'permission_denied'
+  | 'model_not_found'
+  | 'error'
+  | 'skipped_cooldown';
+
+export interface AttemptLogEntry {
+  keyIndex: number;
+  outcome: AttemptOutcome;
+}
+
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
     return res.status(405).json({
@@ -37,6 +51,8 @@ export default async function handler(req: any, res: any) {
       reason: 'error',
       message: 'Method not allowed. Use POST.',
       detail: `Received ${req.method}`,
+      attempts: 0,
+      attemptLog: [],
     });
   }
 
@@ -47,6 +63,8 @@ export default async function handler(req: any, res: any) {
       reason: 'no_keys',
       message: 'No Gemini API keys configured on server (GEMINI_KEYS is empty).',
       detail: 'Set GEMINI_KEYS in environment variables.',
+      attempts: 0,
+      attemptLog: [],
     });
   }
 
@@ -58,14 +76,19 @@ export default async function handler(req: any, res: any) {
       reason: 'error',
       message: 'Missing contents in request body.',
       detail: 'Request body must include { contents }.',
+      attempts: 0,
+      attemptLog: [],
     });
   }
 
   const now = Date.now();
+  const attemptLog: AttemptLogEntry[] = [];
   const availableIndices: number[] = [];
+
   for (let i = 0; i < keys.length; i++) {
     const cooldownUntil = keyCooldownMap.get(i);
     if (cooldownUntil && now < cooldownUntil) {
+      attemptLog.push({ keyIndex: i, outcome: 'skipped_cooldown' });
       continue;
     }
     if (cooldownUntil && now >= cooldownUntil) {
@@ -81,6 +104,7 @@ export default async function handler(req: any, res: any) {
       message: 'All server Gemini keys are currently in 5-minute cooldown.',
       detail: `All ${keys.length} key(s) returned 429 within the last 5 minutes.`,
       attempts: 0,
+      attemptLog,
     });
   }
 
@@ -107,6 +131,7 @@ export default async function handler(req: any, res: any) {
 
       const text = response?.text ? response.text.trim() : '';
       if (!text) {
+        attemptLog.push({ keyIndex, outcome: 'error' });
         lastClassified = {
           status: 502,
           reason: 'error',
@@ -120,13 +145,16 @@ export default async function handler(req: any, res: any) {
           message: lastClassified.message,
           detail: lastClassified.detail,
           attempts,
+          attemptLog,
         });
       }
 
+      attemptLog.push({ keyIndex, outcome: 'ok' });
       return res.status(200).json({
         success: true,
         text,
         keyIndex,
+        attemptLog,
       });
     } catch (err: unknown) {
       const rawMsg =
@@ -139,6 +167,15 @@ export default async function handler(req: any, res: any) {
 
       const classified = classifyGeminiError(err);
       lastClassified = classified;
+
+      const outcome: AttemptOutcome =
+        classified.reason === 'quota_exhausted' ||
+        classified.reason === 'invalid_key' ||
+        classified.reason === 'permission_denied' ||
+        classified.reason === 'model_not_found'
+          ? classified.reason
+          : 'error';
+      attemptLog.push({ keyIndex, outcome });
 
       if (classified.reason === 'quota_exhausted') {
         keyCooldownMap.set(keyIndex, Date.now() + COOLDOWN_MS);
@@ -159,6 +196,7 @@ export default async function handler(req: any, res: any) {
         message: classified.message,
         detail: classified.detail,
         attempts,
+        attemptLog,
       });
     }
   }
@@ -169,5 +207,6 @@ export default async function handler(req: any, res: any) {
     message: lastClassified.message,
     detail: lastClassified.detail,
     attempts,
+    attemptLog,
   });
 }
